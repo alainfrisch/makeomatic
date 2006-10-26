@@ -57,25 +57,43 @@ void print_access_mode(int mode) {
   if (mode & X_OK) fprintf(stdout,"X_OK "); */
 }
 
+static FILE *fifo_cmd;
+static FILE *fifo_ping;
+static int in_init = 0;
+
+static void init() {
+  if (fifo_cmd) return;
+  in_init = 1;
+  char *fn;
+
+  fn = getenv("MAKEOMATIC_FIFO_CMD");
+  if (!fn) {
+    fprintf(stderr,"MAKEOMATIC_FIFO_CMD undefined\n");
+    _exit(2);
+  }
+  fifo_cmd = fopen(fn, "r+");
+  if (!fifo_cmd) {
+    fprintf(stderr,"%s cannot be opened\n",fn);
+    _exit(2);
+  }
 
 
-static int makeomatic_susp = 0;
-void makeomatic_sigcont() {  fprintf(stderr,"SIGNAL\n"); 
- makeomatic_susp = 1; return; }
+  fn = getenv("MAKEOMATIC_FIFO_PING");
+  if (!fn) {
+    fprintf(stderr,"MAKEOMATIC_FIFO_PING undefined\n");
+    _exit(2);
+  }
+  fifo_ping = fopen(fn, "r");
+  if (!fifo_ping) {
+    fprintf(stderr,"%s cannot be opened\n",fn);
+    _exit(2);
+  }
+  in_init = 0;
+}
+
 void makeomatic_wait() {
-  /*
-  fprintf(stderr,"pausing\n"); 
-  makeomatic_susp = 0;
-  signal(SIGCONT,&makeomatic_sigcont);
-  printf("%i\n",getpid());
-  fflush(stdout);
-  fprintf(stderr,"susp=%d\n",makeomatic_susp);
-  if (!makeomatic_susp) pause(); // RACE CONDITION!
-  fprintf(stderr,"restart\n");  
-  */
-
-  fflush(stdout);
-  getchar();
+  fflush(fifo_cmd);
+  fgetc(fifo_ping);
 }
 
 
@@ -83,7 +101,8 @@ void makeomatic_wait() {
 int access(const char *pathname, int mode)
 {
   static int (*func)(const char*, int);
-  fprintf(stdout,"%saccess %d %s\n", prefix, mode, pathname);
+  init();
+  fprintf(fifo_cmd,"%saccess %d %s\n", prefix, mode, pathname);
   print_access_mode(mode);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "access");
@@ -93,7 +112,8 @@ int access(const char *pathname, int mode)
 int __lxstat64(int ver, const char *path, struct stat64 *buf)
 {
   static int (*func)(int, const char *, struct stat64 *);
-  fprintf(stdout,"%s__lxstat64 %s\n", prefix,path);
+  init();
+  fprintf(fifo_cmd,"%s__lxstat64 %s\n", prefix,path);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "__lxstat64");
   return func(ver,path,buf);
@@ -102,8 +122,11 @@ int __lxstat64(int ver, const char *path, struct stat64 *buf)
 FILE *fopen(const char *path, const char *mode)
 {
   static FILE *(*func)(const char*, const char*);
-  fprintf(stdout,"%sfopen %s %s\n", prefix,mode,path);
-  makeomatic_wait();
+  if (!in_init) {
+    init();
+    fprintf(fifo_cmd,"%sfopen %s %s\n", prefix,mode,path);
+    makeomatic_wait();
+  }
   if(!func) func = dlsym(RTLD_NEXT, "fopen");
   return func(path,mode);
 }
@@ -111,8 +134,11 @@ FILE *fopen(const char *path, const char *mode)
 FILE *fopen64(const char *path, const char *mode)
 {
   static FILE *(*func)(const char*, const char*);
-  fprintf(stdout,"%sfopen %s %s\n", prefix,mode,path);
-  makeomatic_wait();
+  if (!in_init) {
+    init();
+    fprintf(fifo_cmd,"%sfopen %s %s\n", prefix,mode,path);
+    makeomatic_wait();
+  }
   if(!func) func = dlsym(RTLD_NEXT, "fopen64");
   return func(path,mode);
 }
@@ -120,7 +146,8 @@ FILE *fopen64(const char *path, const char *mode)
 int open(const char *path, int flags, mode_t mode)
 {
   static int (*func)(const char*, int, mode_t);
-  fprintf(stdout,"%sopen %d %s\n", prefix, flags, path); 
+  init();
+  fprintf(fifo_cmd,"%sopen %d %s\n", prefix, flags, path); 
   print_open_flags(flags);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "open");
@@ -130,7 +157,8 @@ int open(const char *path, int flags, mode_t mode)
 int open64(const char *path, int flags, mode_t mode)
 {
   static int (*func)(const char*, int, mode_t);
-  fprintf(stdout,"%sopen64 %d %s\n", prefix, flags, path);
+  init();
+  fprintf(fifo_cmd,"%sopen64 %d %s\n", prefix, flags, path);
   print_open_flags(flags);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "open64");
@@ -140,7 +168,8 @@ int open64(const char *path, int flags, mode_t mode)
 int __xstat64(int ver, const char *path, struct stat64 *buf)
 {
   static int (*func)(int, const char *, struct stat64 *);
-  fprintf(stdout,"%s__xstat64 %s\n", prefix, path);
+  init();
+  fprintf(fifo_cmd,"%s__xstat64 %s\n", prefix, path);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "__xstat64");
   return func(ver,path,buf);
@@ -149,7 +178,8 @@ int __xstat64(int ver, const char *path, struct stat64 *buf)
 int __fxstat64(int ver, int fd, struct stat64 *buf)
 {
   static int (*func)(int, int, struct stat64 *);
-  fprintf(stdout,"%s__fxstat64 %i\n", prefix, fd);
+  init();
+  fprintf(fifo_cmd,"%s__fxstat64 %i\n", prefix, fd);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "__fxstat64");
   return func(ver,fd,buf);
@@ -158,7 +188,8 @@ int __fxstat64(int ver, int fd, struct stat64 *buf)
 int fstat64(int fd, struct stat64 *buf)
 {
   static int (*func)(int, struct stat64 *);
-  fprintf(stdout,"%sfstat64 %d\n", prefix, fd);
+  init();
+  fprintf(fifo_cmd,"%sfstat64 %d\n", prefix, fd);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "fstat64");
   return func(fd,buf);
@@ -167,7 +198,8 @@ int fstat64(int fd, struct stat64 *buf)
 int __fstat(int fd, struct stat *buf)
 {
   static int (*func)(int, struct stat *);
-  fprintf(stdout,"%s__fxstat %d\n", prefix,fd);
+  init();
+  fprintf(fifo_cmd,"%s__fxstat %d\n", prefix,fd);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "__fxstat");
   return(func(fd,buf));
@@ -176,7 +208,8 @@ int __fstat(int fd, struct stat *buf)
 int stat(const char *path, struct stat *buf)
 {
   static int (*func)(const char *, struct stat *);
-  fprintf(stdout,"%sstat %s\n", prefix,path);
+  init();
+  fprintf(fifo_cmd,"%sstat %s\n", prefix,path);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "stat");
   return(func(path,buf));
@@ -185,7 +218,8 @@ int stat(const char *path, struct stat *buf)
 FILE *fdopen(int fd, const char *mode)
 {
   static FILE *(*func)(int fd, const char*);
-  fprintf(stdout,"%sfdopen %s %d\n",prefix,mode,fd);
+  init();
+  fprintf(fifo_cmd,"%sfdopen %s %d\n",prefix,mode,fd);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "fdopen");
   return func(fd,mode);
@@ -195,26 +229,29 @@ FILE *fdopen(int fd, const char *mode)
 int close(int fd)
 {
   static int (*func)(int);
+  init();
   fprintf(stderr,"%sclose %d\n", prefix,fd);
+  if (fd == 0 || fd == 1 || fd == 2) return 0;
   if(!func) func = dlsym(RTLD_NEXT, "close");
   return func(fd);
 }
-*/
 
 int dup2(int fd1,int fd2)
 {
   static int (*func)(int,int);
-  //fprintf(stderr,"%sdup2 %d %d\n", prefix,fd1,fd2);
+  init();
+  fprintf(stderr,"%sdup2 %d %d\n", prefix,fd1,fd2);
   if(!func) func = dlsym(RTLD_NEXT, "dup2");
   if (fd2 == 1 || fd2 == 2) return 0;
   return func(fd1,fd2);
 }
+*/
 
 /*
 ssize_t read(int fd, void *buf, size_t count)
 {
   static ssize_t (*func)();
-  fprintf(stdout,"%sread %i\n", prefix,fd);
+  fprintf(fifo_cmd,"%sread %i\n", prefix,fd);
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "read");
   return(func(fd, buf, count));
@@ -238,24 +275,24 @@ int fexecve(int fd, char *const argv[], char *const envp[]){
 
 int execv(const char *path, char *const argv[]){
   static int (*func)(const char *, char *const[]);
-  fprintf(stdout,"[%d] execv(%s)\n",getpid(),path);
+  fprintf(fifo_cmd,"[%d] execv(%s)\n",getpid(),path);
   if(!func) func = dlsym(RTLD_NEXT, "execv");
   return(func(path,argv));
 }
 
 
 int execle(const char *path, const char *arg, ...){
-  fprintf(stdout,"execle!!\n");
+  fprintf(fifo_cmd,"execle!!\n");
   _exit(2);
 }
 
 int execvp(const char *path, char *const argv[]){
   static int (*func)(const char *, char *const[]);
-  fprintf(stdout,"[%d] execvp(%s)\n",getpid(),path);
+  fprintf(fifo_cmd,"[%d] execvp(%s)\n",getpid(),path);
   {
     int i = 0;
     while (argv[i]) {
-      fprintf(stdout," arg:%s\n",argv[i]);
+      fprintf(fifo_cmd," arg:%s\n",argv[i]);
       i++;
     }
   }
@@ -269,7 +306,7 @@ int execvp(const char *path, char *const argv[]){
 
 pid_t vfork(){
   static pid_t (*func)();
-  fprintf(stdout,"vfork()\n");
+  fprintf(fifo_cmd,"vfork()\n");
   if(!func) {
     func = dlsym(RTLD_NEXT, "fork");
   }

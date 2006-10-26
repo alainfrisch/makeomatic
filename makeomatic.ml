@@ -170,21 +170,43 @@ let extract_cmd s =
 	  Format.eprintf "** Unknown command: %s@. Aborting." cmd; 
 	  save_cache (); exit 2
 
+let fifo_num = ref 0
+
+let run_background cmdline = 
+  match Unix.fork() with
+    | 0 -> Unix.execv "/bin/sh" [| "/bin/sh"; "-c"; cmdline |]
+    | id -> id
+
+let rec waitpid_non_intr pid =
+  try Unix.waitpid [] pid
+  with Unix.Unix_error (Unix.EINTR, _, _) -> waitpid_non_intr pid
 
 let run_instrumented cmdline callback =
-  let (pout,pin) as p = Unix.open_process cmdline in
+  incr fifo_num;
+  let fifo_cmd_name = Printf.sprintf "CMD%i" !fifo_num in
+  let fifo_ping_name = Printf.sprintf "PING%i" !fifo_num in
+
+  Unix.mkfifo fifo_cmd_name 0o777;
+  Unix.mkfifo fifo_ping_name 0o777;
+  at_exit (fun () -> Sys.remove fifo_cmd_name; Sys.remove fifo_ping_name);
+
+  Unix.putenv "MAKEOMATIC_FIFO_CMD" fifo_cmd_name;
+  Unix.putenv "MAKEOMATIC_FIFO_PING" fifo_ping_name;
+
+  let pid = run_background cmdline in
+  let cmd = open_in fifo_cmd_name in
+  let ping = open_out fifo_ping_name in
+
   (try while true do 
-     let s = input_line pout in
-(*     if !CmdLine.trace then print_endline s; *)
+     let s = input_line cmd in
+     if !CmdLine.trace then print_endline s;
      match extract_cmd s with
        | None -> print_endline s
        | Some cmd -> 
 	   callback cmd; 
-(*	   let pid = int_of_string (input_line pout) in *)
-(*	   Unix.kill pid Sys.sigcont  *)
-	   output_string pin "\n"; flush pin 
+	   output_string ping "\n"; flush ping
    done with End_of_file -> ());
-  match (Unix.close_process p) with
+  match snd(waitpid_non_intr pid) with
     | Unix.WEXITED 0 -> true
     | _ -> false
 
@@ -239,8 +261,8 @@ and interactive ?manual fout cmdline =
       (Hashtbl.replace file_cache fout (List.remove_assoc cmdline cmds,md5);
        raise Not_found);
 
-    for i = 1 to !depth do Format.eprintf " " done;
-    Format.eprintf "%s <- (%s)@." fout cmdline
+(*    for i = 1 to !depth do Format.eprintf " " done;
+    Format.eprintf "%s <- (%s)@." fout cmdline *)
   with Not_found ->
 
   for i = 1 to !depth do Format.eprintf " " done;
@@ -375,17 +397,17 @@ let ocaml_closure obj fns =
   List.rev !needed
 
 let ocamlc fin fout = 
-  Printf.sprintf "ocamlc -c %s" fin
+  Printf.sprintf "ocamlfind ocamlc -package ulex,pcre,netstring -syntax camlp4o -c %s" fin
 let gcc fin fout = 
   Printf.sprintf "gcc -c %s" fin
 let ocamlopt fin fout =
-  Printf.sprintf "ocamlopt -c %s" fin
+  Printf.sprintf "ocamlfind ocamlopt -package ulex,pcre,netstring -syntax camlp4o -c %s" fin
 let ocamlc_link fin fout =
   let fins = ocaml_closure ".cmo" [fin] in
   Printf.sprintf "ocamlc -o %s %s" fout (String.concat " " fins)
 let ocamlopt_link fin fout =
   let fins = ocaml_closure ".cmx" [fin] in
-  Printf.sprintf "ocamlopt -o %s %s" fout (String.concat " " fins)
+  Printf.sprintf "ocamlfind ocamlopt -package ulex,pcre,netstring,num,camlp4 camlp4.cmxa -linkpkg -o %s %s" fout (String.concat " " fins)
 let ocamlyacc fin fout = 
   Printf.sprintf "ocamlyacc %s" fin
 let ocamllex fin fout = 
