@@ -4,7 +4,7 @@ makeomatic_wrapper.so: makeomatic_wrapper.c
 	gcc -o makeomatic_wrapper.so -shared -ldl makeomatic_wrapper.c
 
 makeomatic: makeomatic.ml
-	ocamlc -o makeomatic unix.cma makeomatic.ml
+	ocamlc -o makeomatic unix.cma str.cma makeomatic.ml
 
 
 clean:
