@@ -9,8 +9,8 @@ module CmdLine = struct
   let clean = ref false
   let targets = ref []
   let vars = ref []
-  let tags = ref []
   let trace = ref false
+  let fast = ref false
 
   let specs = 
     Arg.align
@@ -31,16 +31,17 @@ module CmdLine = struct
 
 	"--trace", Set trace,
 	" Trace captured syscalls";
+
+	"--fast", Set fast,
+	" Fast mode";
       ]
 
-  let usage = "Usage:\n  makeomatic <options> [target | +tag | var=val ...]\n"
+  let usage = "Usage:\n  makeomatic <options> [target | var=val ...]\n"
 
   let () =
     parse specs
 	(fun s -> 
-	   if s.[0] = '+' 
-	   then tags := String.sub s 1 (String.length s - 1) :: !tags
-	   else try
+	   try
 	     let eq = String.index s '=' in
 	     vars := (String.sub s 0 eq, 
 		      String.sub s (eq+1) (String.length s - eq - 1)) :: !vars;
@@ -62,7 +63,6 @@ let file_cache, digest_cache as cache_state =
     v
   else Hashtbl.create 1, Hashtbl.create 1
 
-
 let save_cache () =
   let oc = open_out_bin cache_file in
   output_value oc cache_state;
@@ -80,10 +80,12 @@ let digest fn =
   with Not_found -> 
     let md5 = Digest.file fn in
     if !CmdLine.trace then Format.eprintf "MD5(%s)@." fn;
-    Hashtbl.replace digest_cache fn (md5,info);
+    Hashtbl.replace digest_cache fn (md5,info); 
     md5
 
-let force_digest = digest
+let force_digest fn = 
+  Hashtbl.remove digest_cache fn;
+  digest fn
 
 
 let depth = ref 0
@@ -194,7 +196,8 @@ let run_instrumented cmdline callback =
 
   Unix.mkfifo fifo_cmd_name 0o777;
   Unix.mkfifo fifo_ping_name 0o777;
-  at_exit (fun () -> Sys.remove fifo_cmd_name; Sys.remove fifo_ping_name);
+  at_exit (fun () -> 
+	     Sys.remove fifo_cmd_name; Sys.remove fifo_ping_name);
 
   Unix.putenv "MAKEOMATIC_FIFO_CMD" fifo_cmd_name;
   Unix.putenv "MAKEOMATIC_FIFO_PING" fifo_ping_name;
@@ -236,9 +239,9 @@ let sort_deps =
 
 let rec build fn =
   if fn.[0] = '/' then Sys.file_exists fn
-  else let () = if !CmdLine.trace then Format.eprintf "BUILD(%s)@." fn in
-  if Hashtbl.mem already_built fn then Sys.file_exists fn 
+  else if Hashtbl.mem already_built fn then Sys.file_exists fn 
   else let () = Hashtbl.add already_built fn () in
+  if !CmdLine.trace then Format.eprintf "BUILD(%s)@." fn; 
   (match cmdline_for_file fn with
      | None -> ()
      | Some cmdline ->
@@ -248,6 +251,29 @@ let rec build fn =
   else true
       
 and cmdline_for_file fn =
+(*
+  match
+    List.flatten
+      (List.map 
+	 (fun rule -> match rule fn with Some r -> [r] | None -> [])
+	 !build_rules)
+  with
+    | [] -> None
+    | [hd] -> Some hd
+    | hd::_ as l ->
+	Format.eprintf "* multiple rules for %s:@." fn;
+	List.iter (fun r -> Format.eprintf "   + %s@." r) l; 
+	Some hd
+*)
+  if !CmdLine.fast && (Hashtbl.mem file_cache fn || Sys.file_exists fn) then
+    if Hashtbl.mem file_cache fn then
+      let (cmds,_) = Hashtbl.find file_cache fn in
+      let cmd = fst (List.hd cmds) in
+      Some cmd
+    else
+      None
+  else
+    
   let rec aux = function
     | [] -> None
     | rule :: rest -> match rule fn with
@@ -264,9 +290,9 @@ and build_present fn =
   else `File (fn, `Absent)
 
 and check_dep = function
-  | `File (fn, `Absent) -> not (build fn)
+  | `File (fn, `Absent) -> !CmdLine.fast || not (build fn)
   | `File (fn, `Digest md5) -> build fn && digest fn = md5
-  | `File (fn, `Present) -> build fn
+  | `File (fn, `Present) -> !CmdLine.fast || build fn
 
 and check_deps l = List.for_all check_dep l
 
@@ -364,54 +390,6 @@ let main () =
     CmdLine.targets;
   save_cache ()
 
-(* Variables *)
-
-module Tags = Set.Make(String)
-
-type tags = Tags.t
-let (+=) env v = Tags.add v env
-let (-=) env v = Tags.remove v env
-let (///) = Tags.union
-let (!?) v env = Tags.mem v env
-let (~~~) f env = not (f env)
-let (&&&) f1 f2 env = f1 env && f2 env
-let (|||) f1 f2 env = f1 env || f2 env
-
-let tag_filter_rules : (tags -> tags) list ref = ref []
-let files_rules : (tags -> string -> tags) list ref = ref []
-let flags_rules : (string list * string list) list ref = ref []
-
-let filter_tags tags = 
-  List.fold_left (fun tags rule -> rule tags) tags !tag_filter_rules
-let wrap_filter_tags tags kind =
-  (filter_tags (tags += kind)) -= kind
-
-let tags_cmdline = 
-  wrap_filter_tags 
-    (List.fold_left (+=) Tags.empty !CmdLine.tags) "tags_cmdline"
-
-
-let tags_of_file_memo = Hashtbl.create 1
-
-let tags_of_file (filename : string) =
-  try Hashtbl.find tags_of_file_memo filename
-  with Not_found ->
-    let tags = 
-      List.fold_left (fun tags rule -> rule tags filename) tags_cmdline 
-	!files_rules in
-    let tags = wrap_filter_tags tags "tags_file" in
-    Hashtbl.add tags_of_file_memo filename tags;
-    tags
-
-let get_flags fn extra =
-  let tags = filter_tags (List.fold_left (+=) (tags_of_file fn) extra) in
-  let flags =  List.flatten (List.map 
-			       (fun (cond,flags) -> 
-				  if List.for_all (fun x -> Tags.mem x tags)
-				    cond then flags else [])
-			       !flags_rules) in
-  if flags = [] then "" else (String.concat " " flags ^ " ")
-
 (* Helpers to write rules *)
 
 let depends file =
@@ -432,129 +410,20 @@ let test_ext fn ext =
 let ext fn ext1 ext2 =
   match test_ext fn ext1 with Some fn -> Some (fn ^ ext2) | None -> None
 
-let make ext1 ext2 cmd fn =
-  match ext fn ext1 ext2 with 
-    | None -> None
-    | Some f -> 
-	if build f 
-	then Some (cmd f fn) 
-	else None
+let gen ext1l ext2 cmd target =
+  let rec aux = function
+    | [] -> None
+    | ext1 :: rest ->
+	match ext target ext1 ext2 with 
+	  | None -> aux rest
+	  | Some src -> if build src then Some (cmd src target) else None
+  in aux ext1l
 
 let from fout fins f fn =
   if fn = fout && List.for_all build fins then Some (f fins fout) else None
 
 let concat args =
   String.concat " " (List.filter (fun s -> s <> "") args)
-
-(* Rules *)
-
-let ocaml_closure obj fns =
-  let needed = ref [] in
-  let seen = ref [] in
-  let rec aux fn =
-    if List.mem fn !needed then ()
-    else if List.mem fn !seen then 
-      (Printf.eprintf "** Circular dependency when linking %s. Aborting.\n" fn;
-       save_cache ();
-       exit 2
-      )
-    else (
-      seen := fn :: !seen;
-      if build fn then (
-	List.iter
-	  (fun f ->
-	     match ext f ".cmi" obj with 
-	       | None -> ()
-	       | Some f -> if f <> fn then aux f)
-	  (depends fn);
-	needed := fn :: !needed
-      )
-    ) in
-  List.iter aux fns;
-  List.rev !needed
-
-let ocamlc src target =
-  Printf.sprintf "ocamlfind ocamlc -c %s%s"
-    (get_flags src ["ocaml";"compile";"byte"])
-    src
-
-let ocamlc_pack target =
-  Printf.sprintf "ocamlfind ocamlc -pack -c %s-o %s"
-    (get_flags target ["ocaml";"byte"])
-    target
-
-let ocamlopt_pack target =
-  Printf.sprintf "ocamlfind ocamlopt -pack -c %s-o %s"
-    (get_flags target ["ocaml";"opt"])
-    target
-
-let ocamlopt src target =
-  Printf.sprintf "ocamlfind ocamlopt -c %s%s"
-    (get_flags src ["ocaml";"compile";"opt"])
-    src
-
-let ocamlc_link src target =
-  let srcs = ocaml_closure ".cmo" [src] in
-  Printf.sprintf "ocamlfind ocamlc -linkpkg %s -o %s %s"
-    (get_flags target ["ocaml";"compile";"opt"])
-    target (String.concat " " srcs)
-
-let ocamlopt_link src target =
-  let srcs = ocaml_closure ".cmx" [src] in
-  Printf.sprintf "ocamlfind ocamlopt -linkpkg %s -o %s %s"
-    (get_flags target ["ocaml";"compile";"opt"])
-    target (String.concat " " srcs)
-
-let gcc src target =
-  Printf.sprintf "gcc -c %s%s"
-    (get_flags src ["gcc";"compile"])
-    src
-
-let ocamlyacc src target =
-  Printf.sprintf "ocamlyacc %s%s"
-    (get_flags src ["ocamlyacc"])
-    src
-
-let ocamllex src target =
-  Printf.sprintf "ocamllex %s%s"
-    (get_flags src ["ocamlyacc"])
-    src
-
-let cond cnd rule fn =
-  if cnd (tags_of_file fn) then rule fn else None
-
-let () = build_rules := [
-  make ".cmi" ".mli" ocamlc;
-  cond (!? "opt") (make ".cmi" ".ml" ocamlopt);
-  make ".cmi" ".ml" ocamlc;
-  make ".cmo" ".ml" ocamlc;
-  make ".cmx" ".ml" ocamlopt;
-  
-  make ".ml" ".mly" ocamlyacc;
-  make ".mli" ".mly" ocamlyacc;
-  make ".ml" ".mll" ocamllex;
-  make ".byte" ".cmo" ocamlc_link;
-  make ".opt" ".cmx" ocamlopt_link;
-  make ".o" ".ml" ocamlopt;
-  make ".o" ".c" gcc;
-
-  cond (!? "pack") (fun fn -> 
-		      if Filename.check_suffix fn ".cmo" 
-		      then Some (ocamlc_pack fn)
-		      else None);
-  cond (!? "pack") (fun fn -> 
-		      if Filename.check_suffix fn ".cmi" 
-		      then Some (ocamlc_pack (Filename.chop_suffix fn ".cmi" ^ ".cmo"))
-		      else None);
-  cond (!? "pack") (fun fn -> 
-		      if Filename.check_suffix fn ".cmx" 
-		      then Some (ocamlopt_pack fn)
-		      else None);
-  cond (!? "pack") (fun fn -> 
-		      if Filename.check_suffix fn ".o" 
-		      then Some (ocamlopt_pack (Filename.chop_suffix fn ".o" ^ ".cmx"))
-		      else None);
-]
 
 let compile glob =
   let buf = Buffer.create 16 in
@@ -570,33 +439,214 @@ let compile glob =
     glob;
   let re = Str.regexp ("^" ^ (Buffer.contents buf) ^ "$") in
   fun fn -> Str.string_match re fn 0
+
+(****************************************************************************)
+
+
+let ppopt s =
+  let b = Buffer.create 16 in
+  String.iter
+    (function
+       | ' ' -> Buffer.add_string b " -ppopt "
+       | c -> Buffer.add_char b c
+    ) (" " ^ s);
+  Buffer.contents b
+
+let extra_args = 
+  [
+    "*", "-I misc -I parser -I types -I typing -I runtime -I compile -I driver -I schema -package ulex,pcre,netstring,num -syntax camlp4o";
+    "misc/q_symbol.ml", "-pp 'camlp4o pa_extend.cmo q_MLast.cmo'";
+    "driver/run.ml", ppopt "-I misc q_symbol.cmo \
+                            -symbol cduce_version=\\\"ABC\\\" \
+                            -symbol build_date=\\\"X\\\" -symbol ocaml_compiler=\\\"N\\\"";
+
+    "cduce", "-I +camlp4 gramlib.cma";
+  ]
+
+let packs =
+  [ 
+    "x", ["parser";"lexer";"calc"];
+    "y", ["sub/a";"sub/b"];
+    "z", ["x";"y"];
+  ]
+
+let execs =
+  [ "cduce", ["driver/start"] ]
+
+
+let extra_args = 
+  let extra = List.map (fun (re,f) -> compile re, f) extra_args in
+  fun fn ->
+    let args =
+      List.fold_left (fun accu (re,f) -> if re fn then f::accu else accu) 
+	[] extra in
+    String.concat " " args
+
+
+
+
+let ocaml cmd native args = match native,cmd with
+  | false, `Compile src ->
+      let args = extra_args src ^ " " ^ args in
+      Printf.sprintf "ocamlfind ocamlc %s -c %s" args src
+  | false, `Pack (obj,comps) ->
+      let args = extra_args obj ^ " " ^ args in
+      Printf.sprintf "ocamlfind ocamlc %s -pack -o %s %s" args obj comps
+  | false, `Link (obj,comps) ->
+      let args = extra_args obj ^ " " ^ args in
+      Printf.sprintf "ocamlfind ocamlc %s -linkpkg -o %s %s" args obj comps
+  | true, `Compile src ->
+      let args = extra_args src ^ " " ^ args in
+      Printf.sprintf "ocamlfind ocamlopt %s -c %s" args src
+  | true, `Pack (obj,comps) ->
+      let args = extra_args obj ^ " " ^ args in
+      Printf.sprintf "ocamlfind ocamlopt %s -pack -o %s %s" args obj comps
+  | true, `Link (obj,comps) ->
+      let args = extra_args obj ^ " " ^ args in
+      Printf.sprintf "ocamlfind ocamlopt %s -linkpkg -o %s %s" args obj comps
+
+let is_pack fn = List.mem_assoc (Filename.chop_extension fn) packs
+
+(* Transitive closure for OCaml objects *)
+
+let ocaml_closure obj fns =
+  let needed = ref [] in
+  let seen = ref [] in
+  let rec aux fn =
+    if List.mem fn !needed then ()
+    else if List.mem fn !seen then 
+      (Printf.eprintf "** Circular dependency when linking %s. Aborting.\n" fn;
+       save_cache ();
+       exit 2
+      )
+    else (
+      seen := fn :: !seen;
+      if build fn then (
+	if not (is_pack fn) then
+	  List.iter
+	    (fun f ->
+	       match ext f ".cmi" obj with 
+		 | None -> ()
+		 | Some f -> if f <> fn then aux f)
+	    (depends fn);
+	needed := fn :: !needed
+      )
+    ) in
+  List.iter aux fns;
+  String.concat " " (List.rev !needed)
+
+let ocaml_pack obj fn =
+  try
+    if not (Filename.check_suffix fn obj || Filename.check_suffix fn ".cmi")
+    then raise Not_found;
+
+    let m = Filename.chop_extension fn in
+    let comps = List.assoc m packs in
+    let comps = 
+      List.map 
+	(fun s -> 
+	   let f = s ^ obj in if build f then f else
+	     let f = s ^ ".cmi" in if build f then f else
+	       (Printf.eprintf "** Cannot build module %s needed to pack %s\n"
+		  f m;
+		save_cache ();
+		exit 2)
+	) comps in
+    Some (m ^ obj, String.concat " " comps)
+  with Not_found ->
+    None
+
+let ocaml_link execs obj fn =
+  try 
+    let comps = List.assoc fn execs in
+    let comps = List.map (fun f -> f ^ obj) comps in
+    Some (ocaml_closure obj comps)
+  with Not_found ->
+    None
+
+(* Description of the packing structure *)
+
+let modname fn =
+  String.capitalize (Filename.basename fn)
+
+let mk_forpacks () =
+  let container = Hashtbl.create 1 in
+  List.iter 
+    (fun (m,comps) -> 
+       List.iter (fun c -> 
+		    if Hashtbl.mem container c then (
+		      Printf.eprintf "** Module %s packed several times!\n" c;
+		      exit 2);
+		    Hashtbl.add container c m) 
+	 comps) packs;
+  fun f ->
+    if Filename.check_suffix f ".mli" then ""
+    else
+      let rec aux m l =
+	try 
+	  let p = Hashtbl.find container m in 
+	  aux p (modname p :: l)
+	with Not_found -> l in
+      match aux (Filename.chop_extension f) [] with
+	| [] -> ""
+	| l -> Printf.sprintf "-for-pack %s " (String.concat "." l)
+	      
+let forpack = mk_forpacks ()
+
+let cond cnd rule = if cnd then rule else fun fn -> None
+let has v = List.mem_assoc v !CmdLine.vars
+
+let ocamlc src _ = ocaml (`Compile src) false ""
+let ocamlopt src _ = ocaml (`Compile src) true (forpack src)
+let ocamlc_pack fn = match ocaml_pack ".cmo" fn with
+  | Some (target, comps) -> Some (ocaml (`Pack (target,comps)) false "")
+  | None -> None
+let ocamlopt_pack fn = match ocaml_pack ".cmx" fn with
+  | Some (target, comps) -> 
+      Some (ocaml (`Pack (target,comps)) true (forpack target))
+  | None -> None
+let ocamllex src _ =  Printf.sprintf "ocamllex %s" src
+let ocamlyacc src _ =  Printf.sprintf "ocamlyacc %s" src
+let gcc src _ = Printf.sprintf "gcc -c %s" src
+
+let ocaml_exec targ =
+  if has "opt" 
+  then match ocaml_link execs ".cmx" targ with
+    | Some objs -> Some (ocaml (`Link (targ,objs)) true "")
+    | None -> None
+  else match ocaml_link execs ".cmo" targ with
+    | Some objs -> Some (ocaml (`Link (targ,objs)) false "")
+    | None -> None
+
+let ocamlc_link src targ =
+  ocaml (`Link (targ,ocaml_closure ".cmo" [src])) false ""
+
+let ocamlopt_link src targ =
+  ocaml (`Link (targ,ocaml_closure ".cmx" [src])) true ""
+
+let () = build_rules := [
+  (* ocamlc, ocamlopt: compilation *)
+  gen [".cmi"] ".mli" ocamlc;
+  gen [".cmi";".cmo"] ".ml" ocamlc;
+  gen [".cmx";".o"] ".ml" ocamlopt;
+
+  (* ocamlc, ocamlopt: link *)
+  gen [".byte"] ".cmo" ocamlc_link;
+  gen [".opt"] ".cmx" ocamlopt_link;
+
+  ocamlc_pack;
+  ocamlopt_pack;
+  ocaml_exec;
+    
+  (* ocamllex, ocamlyacc *)
+  gen [".ml";".mli"] ".mly" ocamlyacc;
+  gen [".ml"] ".mll" ocamllex;
+
+  (* gc *)
+  gen [".o"] ".c" gcc;
+
+]
+
   
-
-let if_file glob =
-  let test = compile glob in
-  fun c tags f -> if test f then c tags f else tags
-
-let set_tags ts tags f = List.fold_left (+=) tags ts
-
-let pack target contents =
-  files_rules := [
-    if_file (target ^ ".(cmo|cmx|cmi|o)") 
-      (set_tags ["pack";"pack_"^target]);
-    if_file ("(" ^ (String.concat "|" contents) ^ ").ml") 
-      (set_tags ["forpack_" ^ target])
-  ] @ !files_rules;
-  flags_rules := [
-  ["pack_"^target;"ocaml";"byte"], 
-    List.map (fun f -> f ^ ".cmo") contents;
-  ["pack_"^target;"ocaml";"opt"], 
-    List.map (fun f -> f ^ ".cmx") contents;
-  ["forpack_"^target;"ocaml";"opt";"compile"],
-    ["-for-pack " ^ String.capitalize target]
-  ] @ !flags_rules
-
-let () = 
-  pack "x" ["parser";"lexer";"calc"];
-  pack "y" ["sub/a";"sub/b"]
-
 
 let () = main ()
