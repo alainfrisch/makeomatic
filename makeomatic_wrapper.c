@@ -92,6 +92,9 @@ static void init() {
 }
 
 void makeomatic_wait() {
+  char *cwd = getcwd(NULL,0);
+  fprintf(fifo_cmd, "%s\n", cwd);
+  free(cwd);
   fflush(fifo_cmd);
   fgetc(fifo_ping);
 }
@@ -104,6 +107,16 @@ int unlink(const char *pathname)
   makeomatic_wait();
   if(!func) func = dlsym(RTLD_NEXT, "unlink");
   return func(pathname);
+}
+
+int symlink(const char *oldpath, const char *newpath)
+{
+  static int (*func)(const char*, const char*);
+  init();
+  fprintf(fifo_cmd,"%ssymlink %s %s\n", prefix, oldpath, newpath);
+  makeomatic_wait();
+  if(!func) func = dlsym(RTLD_NEXT, "symlink");
+  return func(oldpath,newpath);
 }
 
 int access(const char *pathname, int mode)

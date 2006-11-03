@@ -7,10 +7,15 @@ module type S = sig
   val packs: (string * string list) list
   val execs: (string * string list) list
   val ocaml: cmd -> native:bool -> string -> string
+  val gcc: string -> string
+
+  val rules: (string -> string option) list
 end
 
 let wrapper_so =
   Sys.getenv "HOME" ^ "/makeomatic/makeomatic_wrapper.so"
+
+let cwd = Sys.getcwd ()
 
 
 (* Command line *)
@@ -86,14 +91,15 @@ let file_exists f =
     let files = Hashtbl.find dir_parsed d in
     Hashtbl.mem files b
   with Not_found ->
-(*    Printf.eprintf "parsing dir %s\n" d; flush stderr; *)
+(*    Printf.eprintf "parsing dir %s for %s\n" d f; flush stderr;   *)
     let files = Hashtbl.create 1 in
-    Array.iter (fun f -> Hashtbl.add files f ()) (Sys.readdir d);
+    Array.iter (fun f -> Hashtbl.add files f ()) 
+      (try Sys.readdir d with Sys_error _ -> [||]);
     Hashtbl.replace dir_parsed d files;
     Hashtbl.mem files b
 
 let notify_unlink f =
-(*  Printf.eprintf "unlink: %s\n" f; flush stderr; *)
+(*  Printf.eprintf "unlink: %s\n" f; flush stderr;  *)
   let d = Filename.dirname f in
   let b = Filename.basename f in
   try
@@ -207,19 +213,48 @@ let extract_word s =
 let ign s =
   not (Filename.is_relative s) || s = "."
 
-let extract_cmd s =
+let extract_cmd wd s =
   match test_prefix s "##[MAKEOMATIC]## " with None -> None | Some cmd0 ->
     let cmd,arg = extract_word cmd0 in
+    let adapt fn =
+      if not (Filename.is_relative fn) || cwd = wd then fn
+      else match test_prefix wd (cwd ^ "/") with
+	| Some extra ->
+	    let rec fix current f =
+	      match test_prefix f "../" with
+		| Some f -> 
+		    if f = "." || f = "" then 
+		      failwith "** file above build dir"
+		    else
+		      fix (Filename.dirname current) f
+		| None -> 
+		    if current = "." then f 
+		    else if f = "." then current 
+		    else Filename.concat current f
+	    in
+	    fix extra fn
+	| None -> failwith "** cwd out of build dir..."
+    in
+(*
+    let adapt fn =
+      let f = adapt fn in
+      if f <> fn then (Printf.eprintf "%s ---> %s\n" fn f; flush stderr);
+      f
+    in
+*)
     match cmd with
-      | "__xstat64" ->
+      | "__xstat64" | "__fxstat64" | "__lxstat64" ->
+	  let arg = adapt arg in
 	  if ign arg then Some `Ignore
 	  else Some (`Check arg)
       | "access" -> 
 	  let _,arg = extract_word arg in
+	  let arg = adapt arg in
 	  if ign arg then Some `Ignore
 	  else Some (`Check arg)
       | "open64" | "open" ->
 	  let flags,arg = extract_word arg in
+	  let arg = adapt arg in
 	  if ign arg then Some `Ignore
 	  else
 	  let flags = int_of_string flags in
@@ -231,6 +266,7 @@ let extract_cmd s =
 	  else Some (`Other (arg,cmd0))
       | "fopen" | "fopen64" ->
 	  let mode,arg = extract_word arg in
+	  let arg = adapt arg in
 	  if ign arg then Some `Ignore
 	  else (match mode with
 	     | "w" | "w+" | "w+b" -> Some (`Out arg)
@@ -238,7 +274,13 @@ let extract_cmd s =
 	     | _ -> Some (`Other (arg,cmd0))
 	  )
       | "unlink" ->
+	  let arg = adapt arg in
 	  notify_unlink arg;
+	  Some `Ignore
+      | "symlink" ->
+	  let p1,p2 = extract_word arg in
+	  let p1 = adapt p1 and p2 = adapt p2 in
+	  add_file_exists p2;
 	  Some `Ignore
       | cmd -> 
 	  Format.eprintf "** Unknown command: %s@. Aborting." cmd; 
@@ -257,8 +299,8 @@ let rec waitpid_non_intr pid =
 
 let run_instrumented cmdline callback =
   incr fifo_num;
-  let fifo_cmd_name = Printf.sprintf "CMD%i" !fifo_num in
-  let fifo_ping_name = Printf.sprintf "PING%i" !fifo_num in
+  let fifo_cmd_name = Printf.sprintf "%s/CMD%i" cwd !fifo_num in
+  let fifo_ping_name = Printf.sprintf "%s/PING%i" cwd !fifo_num in
 
   Unix.mkfifo fifo_cmd_name 0o777;
   Unix.mkfifo fifo_ping_name 0o777;
@@ -275,11 +317,12 @@ let run_instrumented cmdline callback =
 
   (try while true do 
      let s = input_line cmd in
+     let cwd = input_line cmd in
      if !CmdLine.trace then print_endline s;
-     match extract_cmd s with
+     match extract_cmd cwd s with
        | None -> print_endline s
-       | Some cmd -> 
-	   callback cmd; 
+       | Some c -> 
+	   callback c;
 	   output_string ping "\n"; flush ping
    done with End_of_file -> ());
   decr depth;
@@ -386,8 +429,10 @@ and interactive fout cmdline =
   let reg fn d = Hashtbl.replace deps fn d in
   let instrument = function
     | `Check fn ->
-	if not (List.mem fn !outputs) && not (Hashtbl.mem deps fn)
-	then reg fn (build_present fn)
+	if fn = fout then ()  (* special case for "make" *)
+	else
+	  if not (List.mem fn !outputs) && not (Hashtbl.mem deps fn)
+	  then reg fn (build_present fn)
     | `Out fn ->
 	add_file_exists fn;
 	Hashtbl.remove digest_checked fn;
@@ -419,7 +464,15 @@ and interactive fout cmdline =
   );
 
   let deps = sort_deps (Hashtbl.fold (fun _ d accu -> d :: accu) deps []) in
-  let outputs = List.filter file_exists !outputs in
+  let outputs = if List.mem fout !outputs then !outputs else fout :: !outputs in
+  let outputs = List.filter file_exists outputs in
+  if not (List.mem fout outputs) then (
+    Printf.eprintf 
+      "** The file %s should have been produced by this command\n"
+      fout
+    ;
+    exit 2
+  );
   List.iter
     (fun fn ->
        let d = force_digest fn in
@@ -533,24 +586,24 @@ let ocaml_closure obj fns =
   let seen = ref [] in
   let rec aux fn =
     if List.mem fn !needed then ()
-    else if List.mem fn !seen then 
-      (Printf.eprintf "** Circular dependency when linking %s. Aborting.\n" fn;
-       save_cache ();
-       exit 2
-      )
-    else (
+    else if build fn then (
+      if List.mem fn !seen then 
+	(Printf.eprintf 
+	   "** Circular dependency when linking %s. Aborting.\n" fn;
+	 save_cache ();
+	 exit 2
+	);
       seen := fn :: !seen;
-      if build fn then (
-	if not (is_pack fn) then
-	  List.iter
-	    (fun f ->
-	       match ext f ".cmi" obj with 
-		 | None -> ()
-		 | Some f -> if f <> fn then aux f)
-	    (depends fn);
-	needed := fn :: !needed
-      )
-    ) in
+      if not (is_pack fn) then
+	List.iter
+	  (fun f ->
+	     match ext f ".cmi" obj with 
+	       | None -> ()
+	       | Some f -> if f <> fn then aux f)
+	  (depends fn);
+      needed := fn :: !needed
+    )
+  in
   List.iter aux fns;
   String.concat " " (List.rev !needed)
 
@@ -626,7 +679,7 @@ let ocamlopt_pack fn = match ocaml_pack ".cmx" fn with
   | None -> None
 let ocamllex src _ =  Printf.sprintf "ocamllex %s" src
 let ocamlyacc src _ =  Printf.sprintf "ocamlyacc %s" src
-let gcc src _ = Printf.sprintf "gcc -c %s" src
+let gcc src _ = X.gcc src
 
 let ocaml_exec targ =
   if Filename.check_suffix targ ".opt" 
@@ -645,7 +698,7 @@ let ocamlc_link src targ =
 let ocamlopt_link src targ =
   ocaml (`Link (targ,ocaml_closure ".cmx" [src])) true ""
 
-let () = build_rules := [
+let () = build_rules := rules @ [
   (* ocamlc, ocamlopt: compilation *)
   gen [".cmi"] ".mli" ocamlc;
   gen [".cmi";".cmo"] ".ml" ocamlc;

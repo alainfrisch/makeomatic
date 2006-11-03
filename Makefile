@@ -15,6 +15,9 @@ makeomatic.cmx: makeomatic.cmi makeomatic.ml
 make_cduce: makeomatic.cmx cduce.ml
 	ocamlopt -o make_cduce unix.cmxa str.cmxa makeomatic.cmx cduce.ml
 
+make_ocaml: makeomatic.cmx ocaml.ml
+	ocamlopt -o make_ocaml unix.cmxa str.cmxa makeomatic.cmx ocaml.ml
+
 
 clean:
 	rm -f *.cm* *.so *.o *.a *~
