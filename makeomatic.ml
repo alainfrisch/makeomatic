@@ -1,3 +1,18 @@
+type cmd = 
+    [ `Compile of string
+    | `Pack of string * string
+    | `Link of string * string ]
+
+module type S = sig
+  val packs: (string * string list) list
+  val execs: (string * string list) list
+  val ocaml: cmd -> native:bool -> string -> string
+end
+
+let wrapper_so =
+  Sys.getenv "HOME" ^ "/makeomatic/makeomatic_wrapper.so"
+
+
 (* Command line *)
 
 module CmdLine = struct
@@ -53,10 +68,50 @@ end
 
 (* Persistent cache *)
 
+let dir_parsed = Hashtbl.create 1
+
+let add_file_exists f =
+(*  Printf.eprintf "add_file: %s\n" f; flush stderr; *)
+  let d = Filename.dirname f in
+  let b = Filename.basename f in
+  try
+    let files = Hashtbl.find dir_parsed d in
+    Hashtbl.replace files b ()
+  with Not_found -> ()
+
+let file_exists f =
+  let d = Filename.dirname f in
+  let b = Filename.basename f in
+  try
+    let files = Hashtbl.find dir_parsed d in
+    Hashtbl.mem files b
+  with Not_found ->
+(*    Printf.eprintf "parsing dir %s\n" d; flush stderr; *)
+    let files = Hashtbl.create 1 in
+    Array.iter (fun f -> Hashtbl.add files f ()) (Sys.readdir d);
+    Hashtbl.replace dir_parsed d files;
+    Hashtbl.mem files b
+
+let notify_unlink f =
+(*  Printf.eprintf "unlink: %s\n" f; flush stderr; *)
+  let d = Filename.dirname f in
+  let b = Filename.basename f in
+  try
+    let files = Hashtbl.find dir_parsed d in
+    Hashtbl.remove files b
+  with Not_found -> ()
+
+let remove f =
+  Sys.remove f;
+  notify_unlink f
+    
+
+
+
 let cache_file = !CmdLine.cache_file
 
 let file_cache, digest_cache as cache_state =
-  if (not !CmdLine.clear_cache) && Sys.file_exists cache_file then
+  if (not !CmdLine.clear_cache) && file_exists cache_file then
     let ic = open_in_bin cache_file in
     let v = input_value ic in
     close_in ic;
@@ -70,22 +125,30 @@ let save_cache () =
 
 (* Digest computation *)
 
+let digest_checked = Hashtbl.create 1
+
 let digest fn =
-  let st = Unix.stat fn in
-  let info = (st.Unix.st_mtime, st.Unix.st_ino) in
-  try 
-    let (md5,info') = Hashtbl.find digest_cache fn in
-    if info <> info' then raise Not_found;
-    md5
-  with Not_found -> 
-    let md5 = Digest.file fn in
-    if !CmdLine.trace then Format.eprintf "MD5(%s)@." fn;
-    Hashtbl.replace digest_cache fn (md5,info); 
+  try Hashtbl.find digest_checked fn
+  with Not_found ->
+(*    Format.eprintf "stat: %s\n" fn; flush stderr; *)
+    let st = Unix.stat fn in
+    let info = (st.Unix.st_mtime, st.Unix.st_ino) in
+    let md5 = try 
+      let (md5,info') = Hashtbl.find digest_cache fn in
+      if info <> info' then raise Not_found;
+      md5
+    with Not_found -> 
+      let md5 = Digest.file fn in
+      if !CmdLine.trace then Format.eprintf "MD5(%s)@." fn; 
+      Hashtbl.replace digest_cache fn (md5,info); 
+      md5 in
+    Hashtbl.replace digest_checked fn md5;
     md5
 
 let force_digest fn = 
   Hashtbl.remove digest_cache fn;
   digest fn
+
 
 
 let depth = ref 0
@@ -174,6 +237,9 @@ let extract_cmd s =
 	     | "r" | "rb" -> Some (`In arg)
 	     | _ -> Some (`Other (arg,cmd0))
 	  )
+      | "unlink" ->
+	  notify_unlink arg;
+	  Some `Ignore
       | cmd -> 
 	  Format.eprintf "** Unknown command: %s@. Aborting." cmd; 
 	  save_cache (); exit 2
@@ -238,8 +304,8 @@ let sort_deps =
        | _ -> 1)
 
 let rec build fn =
-  if fn.[0] = '/' then Sys.file_exists fn
-  else if Hashtbl.mem already_built fn then Sys.file_exists fn 
+  if fn.[0] = '/' then file_exists fn
+  else if Hashtbl.mem already_built fn then file_exists fn 
   else let () = Hashtbl.add already_built fn () in
   if !CmdLine.trace then Format.eprintf "BUILD(%s)@." fn; 
   (match cmdline_for_file fn with
@@ -247,7 +313,7 @@ let rec build fn =
      | Some cmdline ->
 	 if need_to_run fn cmdline then interactive fn cmdline
 (*	 else Format.eprintf "%s <- (%s)@." fn cmdline*));
-  if not (Sys.file_exists fn) then (Hashtbl.add absents fn (); false)
+  if not (file_exists fn) then (Hashtbl.add absents fn (); false)
   else true
       
 and cmdline_for_file fn =
@@ -265,7 +331,7 @@ and cmdline_for_file fn =
 	List.iter (fun r -> Format.eprintf "   + %s@." r) l; 
 	Some hd
 *)
-  if !CmdLine.fast && (Hashtbl.mem file_cache fn || Sys.file_exists fn) then
+  if !CmdLine.fast && (Hashtbl.mem file_cache fn || file_exists fn) then
     if Hashtbl.mem file_cache fn then
       let (cmds,_) = Hashtbl.find file_cache fn in
       let cmd = fst (List.hd cmds) in
@@ -300,7 +366,7 @@ and need_to_run fout cmdline =
   if Hashtbl.mem already_run cmdline then false
   else try
     let (cmds,md5) = Hashtbl.find file_cache fout in
-    if (not (Sys.file_exists fout)) || (md5 <> digest fout) then
+    if (not (file_exists fout)) || (md5 <> digest fout) then
       (Hashtbl.remove file_cache fout; raise Not_found);
     let deps = List.assoc cmdline cmds in
     if not (check_deps deps) then
@@ -323,6 +389,8 @@ and interactive fout cmdline =
 	if not (List.mem fn !outputs) && not (Hashtbl.mem deps fn)
 	then reg fn (build_present fn)
     | `Out fn ->
+	add_file_exists fn;
+	Hashtbl.remove digest_checked fn;
 	if Hashtbl.mem absents fn then (
 	  Format.eprintf 
 	    "\
@@ -351,7 +419,7 @@ and interactive fout cmdline =
   );
 
   let deps = sort_deps (Hashtbl.fold (fun _ d accu -> d :: accu) deps []) in
-  let outputs = List.filter Sys.file_exists !outputs in
+  let outputs = List.filter file_exists !outputs in
   List.iter
     (fun fn ->
        let d = force_digest fn in
@@ -368,7 +436,7 @@ and interactive fout cmdline =
 let main () =
   if !CmdLine.clean then (
     Hashtbl.iter
-      (fun file _ -> if Sys.file_exists file then Sys.remove file)
+      (fun file _ -> if file_exists file then remove file)
       file_cache;
     Hashtbl.clear file_cache;
     Hashtbl.clear digest_cache;
@@ -381,7 +449,7 @@ let main () =
     dump_genfiles Format.std_formatter;
     exit 0
   );
-  Unix.putenv "LD_PRELOAD" (Sys.argv.(0) ^ "_wrapper.so");
+  Unix.putenv "LD_PRELOAD" wrapper_so;
   List.iter 
     (fun fn -> 
        if not (build fn) then 
@@ -425,7 +493,7 @@ let from fout fins f fn =
 let concat args =
   String.concat " " (List.filter (fun s -> s <> "") args)
 
-let compile glob =
+let compile_glob glob =
   let buf = Buffer.create 16 in
   String.iter
     (function
@@ -440,9 +508,6 @@ let compile glob =
   let re = Str.regexp ("^" ^ (Buffer.contents buf) ^ "$") in
   fun fn -> Str.string_match re fn 0
 
-(****************************************************************************)
-
-
 let ppopt s =
   let b = Buffer.create 16 in
   String.iter
@@ -452,58 +517,12 @@ let ppopt s =
     ) (" " ^ s);
   Buffer.contents b
 
-let extra_args = 
-  [
-    "*", "-I misc -I parser -I types -I typing -I runtime -I compile -I driver -I schema -package ulex,pcre,netstring,num -syntax camlp4o";
-    "misc/q_symbol.ml", "-pp 'camlp4o pa_extend.cmo q_MLast.cmo'";
-    "driver/run.ml", ppopt "-I misc q_symbol.cmo \
-                            -symbol cduce_version=\\\"ABC\\\" \
-                            -symbol build_date=\\\"X\\\" -symbol ocaml_compiler=\\\"N\\\"";
-
-    "cduce", "-I +camlp4 gramlib.cma";
-  ]
-
-let packs =
-  [ 
-    "x", ["parser";"lexer";"calc"];
-    "y", ["sub/a";"sub/b"];
-    "z", ["x";"y"];
-  ]
-
-let execs =
-  [ "cduce", ["driver/start"] ]
+(****************************************************************************)
 
 
-let extra_args = 
-  let extra = List.map (fun (re,f) -> compile re, f) extra_args in
-  fun fn ->
-    let args =
-      List.fold_left (fun accu (re,f) -> if re fn then f::accu else accu) 
-	[] extra in
-    String.concat " " args
+module Make(X : S) = struct
 
-
-
-
-let ocaml cmd native args = match native,cmd with
-  | false, `Compile src ->
-      let args = extra_args src ^ " " ^ args in
-      Printf.sprintf "ocamlfind ocamlc %s -c %s" args src
-  | false, `Pack (obj,comps) ->
-      let args = extra_args obj ^ " " ^ args in
-      Printf.sprintf "ocamlfind ocamlc %s -pack -o %s %s" args obj comps
-  | false, `Link (obj,comps) ->
-      let args = extra_args obj ^ " " ^ args in
-      Printf.sprintf "ocamlfind ocamlc %s -linkpkg -o %s %s" args obj comps
-  | true, `Compile src ->
-      let args = extra_args src ^ " " ^ args in
-      Printf.sprintf "ocamlfind ocamlopt %s -c %s" args src
-  | true, `Pack (obj,comps) ->
-      let args = extra_args obj ^ " " ^ args in
-      Printf.sprintf "ocamlfind ocamlopt %s -pack -o %s %s" args obj comps
-  | true, `Link (obj,comps) ->
-      let args = extra_args obj ^ " " ^ args in
-      Printf.sprintf "ocamlfind ocamlopt %s -linkpkg -o %s %s" args obj comps
+  open X
 
 let is_pack fn = List.mem_assoc (Filename.chop_extension fn) packs
 
@@ -610,13 +629,15 @@ let ocamlyacc src _ =  Printf.sprintf "ocamlyacc %s" src
 let gcc src _ = Printf.sprintf "gcc -c %s" src
 
 let ocaml_exec targ =
-  if has "opt" 
-  then match ocaml_link execs ".cmx" targ with
+  if Filename.check_suffix targ ".opt" 
+  then match ocaml_link execs ".cmx" (Filename.chop_suffix targ ".opt") with
     | Some objs -> Some (ocaml (`Link (targ,objs)) true "")
     | None -> None
-  else match ocaml_link execs ".cmo" targ with
+  else if Filename.check_suffix targ ".byte"
+  then match ocaml_link execs ".cmo" (Filename.chop_suffix targ ".byte") with
     | Some objs -> Some (ocaml (`Link (targ,objs)) false "")
     | None -> None
+  else None
 
 let ocamlc_link src targ =
   ocaml (`Link (targ,ocaml_closure ".cmo" [src])) false ""
@@ -647,6 +668,9 @@ let () = build_rules := [
 
 ]
 
-  
 
-let () = main ()
+let () = 
+  Sys.catch_break true;
+  main ()
+
+end

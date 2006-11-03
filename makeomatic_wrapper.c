@@ -96,7 +96,15 @@ void makeomatic_wait() {
   fgetc(fifo_ping);
 }
 
-
+int unlink(const char *pathname)
+{
+  static int (*func)(const char*);
+  init();
+  fprintf(fifo_cmd,"%sunlink %s\n", prefix, pathname);
+  makeomatic_wait();
+  if(!func) func = dlsym(RTLD_NEXT, "unlink");
+  return func(pathname);
+}
 
 int access(const char *pathname, int mode)
 {
